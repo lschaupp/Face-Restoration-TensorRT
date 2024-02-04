@@ -68,6 +68,13 @@ FaceRestoration::FaceRestoration(const std::string engine_file_path) {
     assert(engine->getBindingDataType(inputIndex) == nvinfer1::DataType::kFLOAT);
     outputIndex = engine->getBindingIndex(OUTPUT_BLOB_NAME);
     assert(engine->getBindingDataType(outputIndex) == nvinfer1::DataType::kFLOAT);
+
+    
+    CHECK(cudaMalloc(&buffers[inputIndex], INPUT_SIZE * sizeof(float)));
+    CHECK(cudaMalloc(&buffers[outputIndex], OUTPUT_SIZE * sizeof(float)));
+    CHECK(cudaMallocHost((void **)&input, INPUT_SIZE * sizeof(float)));
+    CHECK(cudaMallocHost((void **)&output, OUTPUT_SIZE * sizeof(float)));
+    CHECK(cudaStreamCreate(&stream));
 }
 
 
@@ -77,8 +84,13 @@ FaceRestoration::~FaceRestoration() {
     delete engine;
     delete runtime;
 
-    delete input;
-    delete output;
+    // delete input;
+    // delete output;
+    CHECK(cudaFreeHost(input));
+    CHECK(cudaFreeHost(output));
+    CHECK(cudaFree(buffers[inputIndex]));
+    CHECK(cudaFree(buffers[outputIndex]));
+    cudaStreamDestroy(stream);
 }
 
 
@@ -135,20 +147,16 @@ void FaceRestoration::blobFromImages(std::vector<cv::Mat>& imgs, float* input) {
 
 
 void FaceRestoration::doInference(IExecutionContext& context, float* input, float* output) {
-    void* buffers[2];
-    CHECK(cudaMalloc(&buffers[inputIndex], INPUT_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&buffers[outputIndex], OUTPUT_SIZE * sizeof(float)));
-    cudaStream_t stream;
-    CHECK(cudaStreamCreate(&stream));
 
+    // buffers[0] = input;
+    // buffers[1] = output;
     CHECK(cudaMemcpyAsync(buffers[inputIndex], input, INPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice, stream));
     context.enqueueV2(buffers, stream, nullptr);
     CHECK(cudaMemcpyAsync(output, buffers[outputIndex], OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
     cudaStreamSynchronize(stream);
 
-    cudaStreamDestroy(stream);
-    CHECK(cudaFree(buffers[inputIndex]));
-    CHECK(cudaFree(buffers[outputIndex]));
+    
+
 }
 
 py::array_t<uint8_t> FaceRestoration::infer(py::array_t<uint8_t>& imgs)
@@ -164,6 +172,7 @@ py::array_t<uint8_t> FaceRestoration::infer(py::array_t<uint8_t>& imgs)
     uint8_t *ptr = static_cast<uint8_t *>(buf.ptr);
 
     std::vector<cv::Mat> cvimgs;
+    auto startTime = std::chrono::high_resolution_clock::now();
     for (py::ssize_t index = 0; index < batch_size; ++index) {
         // Create an OpenCV Mat using the array data
         cv::Mat image(rows, cols, CV_8UC3, ptr + index * rows * cols * channels);
@@ -171,23 +180,40 @@ py::array_t<uint8_t> FaceRestoration::infer(py::array_t<uint8_t>& imgs)
         imagePreProcess(image, img_resized);
         cvimgs.push_back(img_resized);
     }
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto totalTime = std::chrono::duration<float, std::milli>(endTime - startTime).count();
+    std::cout << "preprocess " << totalTime << " ms" << '\n';
 
+    startTime = std::chrono::high_resolution_clock::now();
     blobFromImages(cvimgs, input);
+    endTime = std::chrono::high_resolution_clock::now();
+    totalTime = std::chrono::duration<float, std::milli>(endTime - startTime).count();
+    std::cout << "blobbing " << totalTime << " ms" << '\n';
+
+    startTime = std::chrono::high_resolution_clock::now();
     doInference(*context, input, output);
+    endTime = std::chrono::high_resolution_clock::now();
+    totalTime = std::chrono::duration<float, std::milli>(endTime - startTime).count();
+    std::cout << "inference " <<  totalTime << " ms" << '\n';
+
     std::vector<cv::Mat> res;
+    startTime = std::chrono::high_resolution_clock::now();
     imagesPostProcess(output, res);
+    endTime = std::chrono::high_resolution_clock::now();
+    totalTime = std::chrono::duration<float, std::milli>(endTime - startTime).count();
+    std::cout << "post " << totalTime << " ms" << '\n' << '\n';
 
     // Loop through each image in the vector and save it
-    for (int i = 0; i < res.size(); ++i) {
-        // Create a filename for the image (you can customize the filename as needed)
-        std::string filename = "image_" + std::to_string(i) + ".jpg";
+    // for (int i = 0; i < res.size(); ++i) {
+    //     // Create a filename for the image (you can customize the filename as needed)
+    //     std::string filename = "image_" + std::to_string(i) + ".jpg";
 
-        // Save the image
-        cv::imwrite(filename, res[i]);
+    //     // Save the image
+    //     cv::imwrite(filename, res[i]);
 
-        // Optionally, you can print the filename to confirm the saving process
-        std::cout << "Saved: " << filename << std::endl;
-    }
+    //     // Optionally, you can print the filename to confirm the saving process
+    //     std::cout << "Saved: " << filename << std::endl;
+    // }
 
     // Concatenate the images in the batch
     cv::Mat concatenated;
@@ -197,16 +223,15 @@ py::array_t<uint8_t> FaceRestoration::infer(py::array_t<uint8_t>& imgs)
     cv::Mat reshaped(concatenated.rows, batch_size * cols, concatenated.type());
     reshaped.convertTo(reshaped, CV_8U);
 
-    /*py::array_t<uint8_t> py_output(
+    py::array_t<uint8_t> py_output(
         py::buffer_info(
-            reshaped.data,
+            concatenated.data,
             sizeof(uint8_t), // itemsize
             py::format_descriptor<uint8_t>::format(),
-            3, // ndim
+            4, // ndim
             std::vector<size_t>{batch_size, rows, cols, 3}, // shape
-            std::vector<size_t>{sizeof(uint8_t) * batch_size * cols * 3, sizeof(uint8_t) * cols * 3, sizeof(uint8_t) * 3, sizeof(uint8_t)}
+            std::vector<size_t>{sizeof(uint8_t) * rows * cols * 3, sizeof(uint8_t) * cols * 3, sizeof(uint8_t) * 3, sizeof(uint8_t)}
         )
-    );*/
-    py::array_t<uint8_t> py_output;
- return py_output;
+    );
+    return py_output;
 }
